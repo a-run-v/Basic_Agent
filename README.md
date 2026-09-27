@@ -1,82 +1,95 @@
+# aiagent-basic
 
+A hands-on, minimal walkthrough of building an AI agent from scratch using a **local Ollama** model through the **OpenAI SDK**.
 
-# Define a list of schemas that declare the tools (functions) available to the AI model.
-# This structure follows the standard format required for LLM tool-calling APIs (like OpenAI).
-TOOL_SCHEMAS = [
-    {
-        # Specify that this tool is a executable function
-        "type": "function",
-        "function": {
-            # The exact name of the Python function the model will look for
-            "name": "read_file",
-            # A natural language description that helps the model understand *when* to use this tool
-            "description": "Read a text file and return its contents",
-            # Define the arguments (inputs) that the model needs to provide to run this function
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    # Define the 'path' parameter, its expected data type, and what it represents
-                    "path": {"type": "string", "description": "Name of the file to read"}
-                },
-                # Explicitly state that the 'path' argument must be provided by the model
-                "required": ["path"],
-            },
-        },
-    },
-]
+Each `stepN.py` file is a self-contained, runnable example that adds one concept on top of the previous one. Read them in order.
 
-=====
+| File | What it teaches |
+| --- | --- |
+| `step1.py` | One-shot chat completion against a local model |
+| `step2.py` | Multi-turn chat loop with conversation memory |
+| `step3.py` | Tool / function calling — a real tool-calling agent loop |
+| `main.py` | Package entrypoint stub |
+| `notes.txt` | Sample document the agent in `step3.py` reads |
 
-Why is get_tool_call Required?
-When using standard OpenAI models (like gpt-4o), tool calling is handled at the API protocol level:
+## Requirements
 
-The API response returns a structured field: reply.tool_calls.
-reply.content is usually None when a tool call occurs.
-However, when using Ollama as a local OpenAI-compatible endpoint:
+- Python 3.14+ (`uv` manages this via `.python-version`)
+- [Ollama](https://ollama.com) installed and running (`ollama serve`)
 
-Inconsistent Function Calling Support: Not all open-source local models (or Ollama API versions) populate the native reply.tool_calls object reliably.
-Raw Text JSON Responses: Many open-source models (e.g., Qwen, Llama 3) respond to tool prompts by outputting raw JSON text directly inside reply.content (e.g. {"name": "read_file", "arguments": {"path": "notes.txt"}}), while reply.tool_calls remains None.
-get_tool_call acts as a normalization wrapper. It ensures your code gets a clean Python dictionary ({"name": "...", "arguments": {...}}) regardless of whether the model used official OpenAI schema structured objects or output raw JSON text inside content.
+## Setup
 
-Detailed Line-by-Line Breakdown of get_tool_call
+```bash
+uv sync                      # or: pip install -r requirements.txt
+```
 
-Apply
-def get_tool_call(reply):
-Step 1: Check for Native Structured Tool Calls
+Pull the models used by the examples (once):
 
-Apply
-    if reply.tool_calls:
-        call = reply.tool_calls[0]
-        return {"name": call.function.name, "arguments": call.function.arguments}
-How it works: Checks if the SDK/Ollama successfully populated the native OpenAI tool_calls array.
-Result: If present, extracts the function name and arguments directly from the first tool call object and returns a normalized dictionary.
-Step 2: Handle Raw Text Fallback (When tool_calls is empty)
+```bash
+ollama pull qwen2.5:3b
+ollama pull qwen2.5-coder:3b-instruct-q4_K_M
+ollama pull qwen2.5-coder:14b
+```
 
-Apply
-    text = reply.content or ""
-    if "{" not in text or "}" not in text:
-        return None
-How it works: If reply.tool_calls was empty, it inspects the plain text output in reply.content.
-Guard clause: If the text doesn't contain curly braces {} at all, it means the model output plain text (a final answer, not JSON). It returns None immediately.
-Step 3: Extract & Parse JSON Substring
+Verify what's available with `ollama list` — the model string passed to the API must match exactly.
 
-Apply
-    try:
-        call = json.loads(text[text.index("{"):text.rindex("}") + 1])
-    except ValueError:
-        return None
-text.index("{"): Finds the index of the first { in the string.
-text.rindex("}"): Finds the index of the last } in the string.
-text[text.index("{"):text.rindex("}") + 1]: Slices the exact JSON substring out of the response. This is crucial because local models sometimes output extra conversational text around the JSON block (e.g., "Sure, let me call the tool: {"name": ...}").
-json.loads(...): Parses the sliced JSON string into a Python dictionary.
-except ValueError: If the text inside {} isn't valid JSON, it catches the error and safely returns None.
-Step 4: Validate Tool Schema Structure
+## Running the steps
 
-Apply
-    if "name" in call and "arguments" in call:
-        return call
-    return None
-How it works: Checks if the parsed JSON object contains both required keys (name and arguments).
-Result: Returns the dictionary if it represents a valid tool call, or None if it was just a random JSON object.
+```bash
+uv run step1.py
+uv run step2.py
+uv run step3.py
+```
 
-=====
+## The walkthrough
+
+### Step 1 — Single turn
+
+`step1.py` initialises an `OpenAI` client pointed at Ollama's OpenAI-compatible endpoint
+(`http://localhost:11434/v1`) and sends a single user message. Note that `api_key='ollama'` is
+required by the SDK but ignored by Ollama.
+
+### Step 2 — Conversation memory
+
+`step2.py` adds a REPL loop. Every turn appends the user message and the assistant reply to a
+`messages` list, so the model has context. The history is truncated to the last 10 messages to
+keep the prompt bounded.
+
+### Step 3 — Tool calling
+
+`step3.py` is the actual agent. The pieces:
+
+- **`TOOL_SCHEMAS`** — a JSON-Schema description of the `read_file` function, passed to the model
+  as `tools=`. The schema is what tells the model *what* it can call and *when*.
+- **`get_tool_call(reply)`** — a normalisation wrapper. Hosted models return a structured
+  `reply.tool_calls` object; local models often ignore it and instead emit raw JSON text inside
+  `reply.content`. `get_tool_call` handles both, returning `{"name": ..., "arguments": {...}}` or
+  `None`.
+- **The agent loop** — send messages → inspect the reply → if a tool was requested, run it and
+  append the result → loop again. When no tool call comes back, the model's reply *is* the final
+  answer.
+
+The example asks the model to summarize `notes.txt`, which the model does by calling
+`read_file(path="notes.txt")`.
+
+## Why the `get_tool_call` wrapper exists
+
+This trips up everyone building agents on local models:
+
+1. The OpenAI tool-calling protocol puts the call in `reply.tool_calls`, and `reply.content` is
+   typically `None` when a tool is invoked.
+2. Ollama's support for that is inconsistent — many open-source models (Qwen, Llama 3, …) just
+   print the JSON object as plain text: `{"name": "read_file", "arguments": {"path": "notes.txt"}}`.
+3. So `get_tool_call` tries `tool_calls` first, then falls back to slicing the first `{` … last `}`
+   out of the message text and validating that it has `name` and `arguments`.
+
+Once parsed, arguments may arrive as a JSON *string* rather than a dict, so the loop re-parses
+them before dispatching: `step3.py:90`.
+
+## Requirements
+
+`openai>=3.19.2` (see `pyproject.toml`).
+
+## License
+
+Personal learning project — use freely.
